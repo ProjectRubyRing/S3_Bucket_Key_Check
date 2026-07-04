@@ -25,8 +25,11 @@
 # 全バケットの中身を一覧表示し、既定名（./s3_bucket_list_<日時>.csv）で CSV 出力
 ./s3-bucket-key-check.sh
 
-# 特定バケットのみ（カンマ区切りで複数可）、先頭 500 オブジェクトまで
+# 特定バケットのみ（カンマ区切りで複数可）、最新 500 オブジェクトまで
 ./s3-bucket-key-check.sh --bucket my-bucket-a,my-bucket-b --max-keys 500
+
+# 件数制限なしで全オブジェクトを表示（既定は最新 50 件まで）
+./s3-bucket-key-check.sh --max-keys 0
 
 # バケット一覧のみ（中身は取得しない）
 ./s3-bucket-key-check.sh --buckets-only
@@ -88,7 +91,7 @@ CSV（Excel でそのまま開けます）の列:
 | オプション | 説明 |
 | --- | --- |
 | `--bucket <name[,name...]>` | 対象バケットを限定（既定: 確認可能な全バケット） |
-| `--max-keys <n>` | 各バケットで取得する最大オブジェクト数（既定: 0 = 無制限） |
+| `--max-keys <n>` | 各バケットで表示するオブジェクト数の上限。最終更新日時の新しい順に n 件（既定: 50。`0` = 無制限） |
 | `--buckets-only` | バケット一覧のみ表示 |
 | `--output <path>` | CSV 出力先（既定: `./s3_bucket_list_<日時>.csv`） |
 | `--no-csv` | CSV 出力を行わない |

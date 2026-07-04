@@ -48,7 +48,7 @@ source "${SCRIPT_DIR}/common.sh"
 # 1. 既定値
 # ---------------------------------------------------------------------------
 BUCKET_FILTER=""            # 対象バケット名（カンマ区切りで複数可）。空なら全バケット
-MAX_KEYS="0"                # 各バケットで取得する最大オブジェクト数（0 = 無制限）
+MAX_KEYS="50"               # 各バケットで表示する最新オブジェクト数（0 = 無制限）
 BUCKETS_ONLY="false"        # true ならバケット一覧のみ（中身は取得しない）
 OUTPUT_CSV=""               # CSV 出力先パス。空なら既定名で出力
 NO_CSV="false"              # true なら CSV 出力を行わない
@@ -84,8 +84,9 @@ usage() {
 オプション:
   --bucket <name[,name...]>  対象バケットを限定する（カンマ区切りで複数指定可。
                              既定: 一覧で確認できる全バケット）
-  --max-keys <n>             各バケットで取得する最大オブジェクト数
-                             （既定: 0 = 無制限。大量オブジェクトのバケットに有効）
+  --max-keys <n>             各バケットで表示するオブジェクト数の上限
+                             （最終更新日時の新しい順に n 件。既定: 50。
+                              0 を指定すると無制限に全件表示する）
   --buckets-only             バケット一覧のみ表示し、中身の取得を行わない
   --output <path>            CSV 出力先ファイルパス
                              （既定: ./s3_bucket_list_<日時>.csv）
@@ -111,8 +112,11 @@ usage() {
   # 全バケットの中身を一覧表示し、既定名の CSV へ出力
   ./${SCRIPT_NAME}
 
-  # 特定バケットのみ、先頭 500 オブジェクトまで表示
+  # 特定バケットのみ、最新 500 オブジェクトまで表示
   ./${SCRIPT_NAME} --bucket my-artifacts --max-keys 500
+
+  # 件数制限なしで全オブジェクトを表示
+  ./${SCRIPT_NAME} --max-keys 0
 
   # バケット一覧だけ確認（中身は見ない）
   ./${SCRIPT_NAME} --buckets-only
@@ -257,11 +261,12 @@ list_bucket_contents() {
   local region="${2}"
 
   # --- オブジェクト一覧を取得（タブ区切り: Key Size LastModified StorageClass）---
+  #   S3 API はキー名順でしか返さず「最新 N 件」の判定には全件が必要なため、
+  #   取得は常に全件行い、表示件数を後段で MAX_KEYS に絞り込む。
   local aws_args=(s3api list-objects-v2 --bucket "${bucket}"
                   --query 'Contents[].[Key,Size,LastModified,StorageClass]'
                   --output text)
   [[ -n "${region}" ]] && aws_args+=(--region "${region}")
-  [[ "${MAX_KEYS}" -gt 0 ]] && aws_args+=(--max-items "${MAX_KEYS}")
 
   local raw
   if ! raw="$(aws "${aws_args[@]}" 2>/dev/null)"; then
@@ -276,6 +281,24 @@ list_bucket_contents() {
     printf '    %s(空のバケットです)%s\n' "${C_YELLOW}" "${C_RESET}"
     csv_row "${bucket}" "空バケット" "" "" "" "" "" ""
     return 0
+  fi
+
+  # --- MAX_KEYS > 0 なら最終更新日時(LastModified)の新しい順に上位 N 件へ絞り込む ---
+  #   フォルダマーカー（'/' 終わりのキー）は件数に含めない。
+  #   打ち切りは head ではなく awk で行う（pipefail での SIGPIPE 失敗を避けるため）。
+  local total_files=0
+  if [[ "${MAX_KEYS}" -gt 0 ]]; then
+    raw="$(printf '%s\n' "${raw}" \
+           | awk -F'\t' '$1 != "" && $1 != "None" && $1 !~ /\/$/')"
+    total_files="$(printf '%s\n' "${raw}" | grep -c . || true)"
+    raw="$(printf '%s\n' "${raw}" \
+           | LC_ALL=C sort -t$'\t' -k3,3r \
+           | awk -v n="${MAX_KEYS}" 'NR <= n')"
+    if [[ -z "${raw}" ]]; then
+      printf '    %s(ファイルはありません（フォルダマーカーのみ）)%s\n' "${C_YELLOW}" "${C_RESET}"
+      csv_row "${bucket}" "空バケット" "" "" "" "" "" ""
+      return 0
+    fi
   fi
 
   # --- ディレクトリ(prefix)の導出とエントリ一覧の構築 ---
@@ -316,8 +339,8 @@ list_bucket_contents() {
   TOTAL_BYTES=$((TOTAL_BYTES + obj_bytes))
 
   local limited=""
-  [[ "${MAX_KEYS}" -gt 0 && "${obj_count}" -ge "${MAX_KEYS}" ]] \
-    && limited="（--max-keys ${MAX_KEYS} で打ち切り）"
+  [[ "${MAX_KEYS}" -gt 0 && "${total_files}" -gt "${MAX_KEYS}" ]] \
+    && limited="（全 $(with_commas "${total_files}") 件中、最新 ${MAX_KEYS} 件のみ表示。--max-keys 0 で全件）"
   printf '    オブジェクト数: %s / 合計サイズ: %s%s\n' \
     "$(with_commas "${obj_count}")" "$(human_size "${obj_bytes}")" "${limited}"
 
@@ -375,7 +398,7 @@ main() {
   log_info "=== 実行内容 ==="
   log_info "  対象バケット      : ${BUCKET_FILTER:-(確認可能な全バケット)}"
   log_info "  中身の取得        : $([[ "${BUCKETS_ONLY}" == "true" ]] && echo 'しない (--buckets-only)' || echo 'する')"
-  log_info "  最大オブジェクト数: $([[ "${MAX_KEYS}" -gt 0 ]] && echo "${MAX_KEYS}" || echo '無制限')"
+  log_info "  表示オブジェクト数: $([[ "${MAX_KEYS}" -gt 0 ]] && echo "最新 ${MAX_KEYS} 件（--max-keys 0 で無制限）" || echo '無制限')"
   log_info "  CSV 出力          : $([[ "${NO_CSV}" == "true" ]] && echo 'しない' || echo "${OUTPUT_CSV}")"
   log_info "  自動スイッチバック: ${AUTO_SWITCH_BACK}"
   [[ "${AUTO_SWITCH_BACK}" == "true" ]] && \
