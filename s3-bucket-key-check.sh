@@ -48,10 +48,23 @@ source "${SCRIPT_DIR}/common.sh"
 # 1. 既定値
 # ---------------------------------------------------------------------------
 BUCKET_FILTER=""            # 対象バケット名（カンマ区切りで複数可）。空なら全バケット
+PREFIX=""                   # バケット内のディレクトリ(prefix)。空ならバケット直下から全階層
 MAX_KEYS="50"               # 各バケットで表示する最新オブジェクト数（0 = 無制限）
 BUCKETS_ONLY="false"        # true ならバケット一覧のみ（中身は取得しない）
 OUTPUT_CSV=""               # CSV 出力先パス。空なら既定名で出力
 NO_CSV="false"              # true なら CSV 出力を行わない
+
+# --- ファイル内容の表示 / 出力（parquet / gz）関連 ---
+# true なら parquet / gz ファイルの内容をダウンロードして画面表示 + ファイル出力する
+SHOW_CONTENT="false"
+# 内容出力先ディレクトリ。空なら既定名（./s3_content_<日時>）を使う
+CONTENT_DIR=""
+# 内容取得の対象とするオブジェクトの最大サイズ（バイト）。これを超えるものはスキップ
+CONTENT_MAX_BYTES="52428800"   # 50 MiB
+# 画面表示・parquet 変換で扱う行数の上限（0 = 無制限）
+CONTENT_MAX_ROWS="50"
+# gz などテキスト内容を画面表示する際の行数上限（0 = 無制限）
+CONTENT_MAX_LINES="100"
 
 # --- 認証 / 権限（スイッチバック）関連 ---
 # true なら S3 権限が無いとき警告終了せず自動でスイッチバックする
@@ -84,6 +97,8 @@ usage() {
 オプション:
   --bucket <name[,name...]>  対象バケットを限定する（カンマ区切りで複数指定可。
                              既定: 一覧で確認できる全バケット）
+  --prefix <dir>             バケット内のディレクトリ(prefix)を指定して、その配下だけを
+                             対象にする（例: logs/ や data/2026/。既定: バケット全体）
   --max-keys <n>             各バケットで表示するオブジェクト数の上限
                              （最終更新日時の新しい順に n 件。既定: 50。
                               0 を指定すると無制限に全件表示する）
@@ -91,6 +106,16 @@ usage() {
   --output <path>            CSV 出力先ファイルパス
                              （既定: ./s3_bucket_list_<日時>.csv）
   --no-csv                   CSV ファイル出力を行わない（画面表示のみ）
+  --show-content             parquet / gz 形式のファイルをダウンロードして内容を
+                             画面表示し、ファイルにも出力する
+                             ・parquet: スキーマ・行数・先頭データを表形式で表示
+                             ・gz     : 自動解凍して内容を表示（テキスト想定）
+  --content-dir <path>       --show-content の内容出力先ディレクトリ
+                             （既定: ./s3_content_<日時>）
+  --content-max-bytes <n>    内容取得の対象とするオブジェクト最大サイズ(バイト)
+                             （これを超えるものはスキップ。既定: 52428800 = 50MiB）
+  --content-max-rows <n>     parquet の表示・変換行数の上限（既定: 50。0 = 無制限）
+  --content-max-lines <n>    gz などテキスト内容の表示行数の上限（既定: 100。0 = 無制限）
   --auto-switch-back         S3 操作権限が無い場合、警告終了せず自動でスイッチバックする
                              （既定: スイッチバックするよう警告して終了）
   --switch-back-script <path>
@@ -114,6 +139,12 @@ usage() {
 
   # 特定バケットのみ、最新 500 オブジェクトまで表示
   ./${SCRIPT_NAME} --bucket my-artifacts --max-keys 500
+
+  # バケット内の特定ディレクトリ(prefix)配下だけを対象にする
+  ./${SCRIPT_NAME} --bucket my-artifacts --prefix logs/2026/
+
+  # parquet / gz ファイルの中身も画面表示しファイルへ出力する
+  ./${SCRIPT_NAME} --bucket my-data --prefix export/ --show-content
 
   # 件数制限なしで全オブジェクトを表示
   ./${SCRIPT_NAME} --max-keys 0
@@ -140,10 +171,16 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "${1}" in
       --bucket)             BUCKET_FILTER="${2:-}"; shift 2 ;;
+      --prefix)             PREFIX="${2:-}"; shift 2 ;;
       --max-keys)           MAX_KEYS="${2:-}"; shift 2 ;;
       --buckets-only)       BUCKETS_ONLY="true"; shift 1 ;;
       --output)             OUTPUT_CSV="${2:-}"; shift 2 ;;
       --no-csv)             NO_CSV="true"; shift 1 ;;
+      --show-content)       SHOW_CONTENT="true"; shift 1 ;;
+      --content-dir)        CONTENT_DIR="${2:-}"; shift 2 ;;
+      --content-max-bytes)  CONTENT_MAX_BYTES="${2:-}"; shift 2 ;;
+      --content-max-rows)   CONTENT_MAX_ROWS="${2:-}"; shift 2 ;;
+      --content-max-lines)  CONTENT_MAX_LINES="${2:-}"; shift 2 ;;
       --auto-switch-back)   AUTO_SWITCH_BACK="true"; shift 1 ;;
       --switch-back-script) SWITCH_BACK_SCRIPT="${2:-}"; shift 2 ;;
       --debug)              DEBUG="true"; export DEBUG; shift 1 ;;
@@ -164,6 +201,19 @@ validate_inputs() {
   fi
   if [[ "${NO_CSV}" != "true" && -z "${OUTPUT_CSV}" ]]; then
     OUTPUT_CSV="./s3_bucket_list_$(date +%Y%m%d_%H%M%S).csv"
+  fi
+
+  # --- ファイル内容表示（--show-content）関連の検証 ---
+  if [[ "${SHOW_CONTENT}" == "true" ]]; then
+    [[ "${CONTENT_MAX_BYTES}" =~ ^[0-9]+$ ]] || die "--content-max-bytes には 0 以上の整数を指定してください: ${CONTENT_MAX_BYTES}"
+    [[ "${CONTENT_MAX_ROWS}"  =~ ^[0-9]+$ ]] || die "--content-max-rows には 0 以上の整数を指定してください: ${CONTENT_MAX_ROWS}"
+    [[ "${CONTENT_MAX_LINES}" =~ ^[0-9]+$ ]] || die "--content-max-lines には 0 以上の整数を指定してください: ${CONTENT_MAX_LINES}"
+    if [[ "${BUCKETS_ONLY}" == "true" ]]; then
+      die "--show-content と --buckets-only は同時に指定できません（中身を取得しないため）。"
+    fi
+    [[ -z "${CONTENT_DIR}" ]] && CONTENT_DIR="./s3_content_$(date +%Y%m%d_%H%M%S)"
+  elif [[ -n "${CONTENT_DIR}" ]]; then
+    die "--content-dir は --show-content と併せて指定してください。"
   fi
 }
 
@@ -249,6 +299,236 @@ with_commas() {
   printf '%s' "${1}" | awk '{ printf "%\047d", $0 }' 2>/dev/null || printf '%s' "${1}"
 }
 
+# 内容出力ファイル数（--show-content 使用時に main のサマリで表示）
+CONTENT_FILES=0
+
+# ---------------------------------------------------------------------------
+# 7b. ファイル内容の表示 / 出力（--show-content）
+#     parquet / gz 形式のオブジェクトをダウンロードして内容を画面表示し、
+#     同じ内容を CONTENT_DIR 配下のファイルへ出力する。
+#     ※ ダウンロード（s3:GetObject）を伴うため、既定では無効（--show-content で有効化）。
+# ---------------------------------------------------------------------------
+
+# parquet ファイルを人が読みやすい表形式へ整形して標準出力へ出す。
+#   引数: <parquetファイル> <表示行数(0=全件)>
+#   pyarrow / pandas / parquet-tools / duckdb のいずれかを利用する。
+#   0=成功, 非0=利用可能なツールが無い / 読み取り失敗
+render_parquet() {
+  local src="${1}"
+  local max_rows="${2}"
+
+  if command -v python3 >/dev/null 2>&1 \
+     && python3 -c 'import importlib.util,sys; sys.exit(0 if (importlib.util.find_spec("pyarrow") or importlib.util.find_spec("pandas")) else 1)' >/dev/null 2>&1; then
+    python3 - "${src}" "${max_rows}" <<'PY' && return 0
+import sys
+
+src = sys.argv[1]
+n = int(sys.argv[2])
+
+cols = []
+types = []
+nrows = 0
+rows = []
+
+
+def load():
+    global cols, types, nrows, rows
+    try:
+        import pyarrow.parquet as pq
+        tbl = pq.read_table(src)
+        nrows = tbl.num_rows
+        schema = tbl.schema
+        cols = list(schema.names)
+        types = [str(schema.field(i).type) for i in range(len(cols))]
+        limit = nrows if n == 0 else min(n, nrows)
+        for rec in tbl.slice(0, limit).to_pylist():
+            rows.append([rec.get(c) for c in cols])
+        return
+    except ImportError:
+        pass
+    import pandas as pd
+    df = pd.read_parquet(src)
+    nrows = len(df)
+    cols = [str(c) for c in df.columns]
+    types = [str(t) for t in df.dtypes]
+    limit = nrows if n == 0 else min(n, nrows)
+    for _, r in df.head(limit).iterrows():
+        rows.append([r[c] for c in df.columns])
+
+
+def cell(v, width=40):
+    s = "" if v is None else str(v)
+    s = s.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+    if len(s) > width:
+        s = s[: width - 1] + "…"
+    return s
+
+
+load()
+
+print("[parquet] スキーマ ({} 列):".format(len(cols)))
+for c, t in zip(cols, types):
+    print("    - {} ({})".format(c, t))
+print("[parquet] 総行数: {:,}".format(nrows))
+
+shown = len(rows)
+head_cells = [cell(c) for c in cols]
+body = [[cell(v) for v in r] for r in rows]
+widths = [len(h) for h in head_cells]
+for r in body:
+    for i, v in enumerate(r):
+        if len(v) > widths[i]:
+            widths[i] = len(v)
+
+def fmt(vals):
+    return " | ".join(v.ljust(widths[i]) for i, v in enumerate(vals))
+
+label = "全 {} 行".format(nrows) if (n == 0 or nrows <= shown) else "先頭 {} 行".format(shown)
+print("[parquet] データ ({}):".format(label))
+if cols:
+    print("    " + fmt(head_cells))
+    print("    " + "-+-".join("-" * w for w in widths))
+    for r in body:
+        print("    " + fmt(r))
+PY
+  fi
+
+  # フォールバック: parquet-tools / duckdb
+  if command -v parquet-tools >/dev/null 2>&1; then
+    printf '[parquet] スキーマ:\n'
+    parquet-tools schema "${src}" 2>/dev/null | sed 's/^/    /'
+    printf '[parquet] データ:\n'
+    if [[ "${max_rows}" -gt 0 ]]; then
+      parquet-tools head -n "${max_rows}" "${src}" 2>/dev/null | sed 's/^/    /'
+    else
+      parquet-tools cat "${src}" 2>/dev/null | sed 's/^/    /'
+    fi
+    return 0
+  fi
+  if command -v duckdb >/dev/null 2>&1; then
+    local lim=""
+    [[ "${max_rows}" -gt 0 ]] && lim=" LIMIT ${max_rows}"
+    printf '[parquet] データ:\n'
+    duckdb -box -c "SELECT * FROM read_parquet('${src}')${lim};" 2>/dev/null | sed 's/^/    /'
+    return 0
+  fi
+
+  return 1
+}
+
+# 内容表示済みメッセージを画面へインデント付きで出す小ヘルパ
+content_note() {
+  local indent="${1}"; shift
+  printf '%s      %s↳ %s%s\n' "${indent}" "${C_YELLOW}" "$*" "${C_RESET}"
+}
+
+# 1 オブジェクトの内容を取得して画面表示 + ファイル出力する。
+#   引数: <bucket> <region> <key> <size> <画面インデント>
+extract_content() {
+  local bucket="${1}"
+  local region="${2}"
+  local key="${3}"
+  local size="${4}"
+  local indent="${5}"
+
+  # --- 対象拡張子の判定（parquet / gz のみ）---
+  local lower="${key,,}"
+  local kind=""
+  case "${lower}" in
+    *.parquet) kind="parquet" ;;
+    *.gz)      kind="gz" ;;
+    *)         return 0 ;;
+  esac
+
+  # --- サイズ上限チェック ---
+  if [[ "${size}" =~ ^[0-9]+$ && "${CONTENT_MAX_BYTES}" -gt 0 && "${size}" -gt "${CONTENT_MAX_BYTES}" ]]; then
+    content_note "${indent}" "内容表示をスキップ: サイズ $(human_size "${size}") が上限 $(human_size "${CONTENT_MAX_BYTES}") を超過（--content-max-bytes で変更可）"
+    return 0
+  fi
+
+  mkdir -p "${CONTENT_DIR}" 2>/dev/null || { content_note "${indent}" "内容出力先を作成できません: ${CONTENT_DIR}"; return 0; }
+
+  # --- オブジェクトをダウンロード ---
+  local tmpobj
+  tmpobj="$(mktemp "${TMPDIR:-/tmp}/s3content.XXXXXX")"
+  local get_args=(s3api get-object --bucket "${bucket}" --key "${key}")
+  [[ -n "${region}" ]] && get_args+=(--region "${region}")
+  get_args+=("${tmpobj}")
+  if ! aws "${get_args[@]}" >/dev/null 2>&1; then
+    content_note "${indent}" "内容の取得に失敗しました（s3:GetObject 権限を確認してください）"
+    rm -f "${tmpobj}"
+    return 0
+  fi
+
+  # --- 出力先パス（bucket/key の階層を保持）---
+  local destbase="${CONTENT_DIR}/${bucket}/${key}"
+  local rows="${CONTENT_MAX_ROWS}"
+  local lines="${CONTENT_MAX_LINES}"
+
+  if [[ "${kind}" == "parquet" ]]; then
+    # --- parquet: 表形式へ整形して表示 + .txt へ出力 ---
+    local dest="${destbase}.txt"
+    mkdir -p "$(dirname "${dest}")" 2>/dev/null || true
+    local rendered
+    if rendered="$(render_parquet "${tmpobj}" "${rows}" 2>/dev/null)"; then
+      printf '%s' "${rendered}" > "${dest}"
+      printf '%s      %s[内容: parquet]%s\n' "${indent}" "${C_GREEN}" "${C_RESET}"
+      printf '%s\n' "${rendered}" | sed "s/^/${indent}        /"
+      content_note "${indent}" "内容を出力しました: ${dest}"
+      CONTENT_FILES=$((CONTENT_FILES + 1))
+    else
+      content_note "${indent}" "parquet を整形表示できませんでした（pyarrow / pandas / parquet-tools / duckdb のいずれかが必要です）"
+    fi
+
+  else
+    # --- gz: 自動解凍。中身が parquet ならさらに整形、そうでなければテキスト出力 ---
+    local inner="${key%.[gG][zZ]}"     # 末尾 .gz を除去
+    local inner_lower="${inner,,}"
+    local tmpdec
+    tmpdec="$(mktemp "${TMPDIR:-/tmp}/s3decomp.XXXXXX")"
+    if ! gunzip -c "${tmpobj}" > "${tmpdec}" 2>/dev/null; then
+      content_note "${indent}" "gz の解凍に失敗しました（gzip 形式ではない可能性があります）"
+      rm -f "${tmpobj}" "${tmpdec}"
+      return 0
+    fi
+
+    if [[ "${inner_lower}" == *.parquet ]]; then
+      # gz の中身が parquet
+      local dest="${CONTENT_DIR}/${bucket}/${inner}.txt"
+      mkdir -p "$(dirname "${dest}")" 2>/dev/null || true
+      local rendered
+      if rendered="$(render_parquet "${tmpdec}" "${rows}" 2>/dev/null)"; then
+        printf '%s' "${rendered}" > "${dest}"
+        printf '%s      %s[内容: gz -> parquet 解凍済み]%s\n' "${indent}" "${C_GREEN}" "${C_RESET}"
+        printf '%s\n' "${rendered}" | sed "s/^/${indent}        /"
+        content_note "${indent}" "内容を出力しました: ${dest}"
+        CONTENT_FILES=$((CONTENT_FILES + 1))
+      else
+        content_note "${indent}" "解凍後の parquet を整形表示できませんでした（pyarrow / pandas / parquet-tools / duckdb のいずれかが必要です）"
+      fi
+    else
+      # テキスト（想定）として出力
+      local dest="${CONTENT_DIR}/${bucket}/${inner}"
+      mkdir -p "$(dirname "${dest}")" 2>/dev/null || true
+      cp -f "${tmpdec}" "${dest}"
+      local total
+      total="$(wc -l < "${tmpdec}" | tr -d ' ')"
+      printf '%s      %s[内容: gz 解凍済み]%s（%s 行）\n' "${indent}" "${C_GREEN}" "${C_RESET}" "$(with_commas "${total}")"
+      if [[ "${lines}" -gt 0 ]]; then
+        head -n "${lines}" "${tmpdec}" | sed "s/^/${indent}        /"
+        [[ "${total}" -gt "${lines}" ]] && content_note "${indent}" "先頭 ${lines} 行のみ表示（全 $(with_commas "${total}") 行。--content-max-lines 0 で全件）"
+      else
+        sed "s/^/${indent}        /" "${tmpdec}"
+      fi
+      content_note "${indent}" "内容を出力しました: ${dest}"
+      CONTENT_FILES=$((CONTENT_FILES + 1))
+    fi
+    rm -f "${tmpdec}"
+  fi
+
+  rm -f "${tmpobj}"
+}
+
 # ---------------------------------------------------------------------------
 # 8. バケットの中身を一覧表示 + CSV 出力
 #    list-objects-v2 の結果からディレクトリ(prefix)を導出し、階層インデント
@@ -267,6 +547,7 @@ list_bucket_contents() {
                   --query 'Contents[].[Key,Size,LastModified,StorageClass]'
                   --output text)
   [[ -n "${region}" ]] && aws_args+=(--region "${region}")
+  [[ -n "${PREFIX}" ]] && aws_args+=(--prefix "${PREFIX}")
 
   local raw
   if ! raw="$(aws "${aws_args[@]}" 2>/dev/null)"; then
@@ -278,7 +559,11 @@ list_bucket_contents() {
 
   # 空バケット（--output text は Contents が無いと "None" を返す）
   if [[ -z "${raw}" || "${raw}" == "None" ]]; then
-    printf '    %s(空のバケットです)%s\n' "${C_YELLOW}" "${C_RESET}"
+    if [[ -n "${PREFIX}" ]]; then
+      printf '    %s(指定ディレクトリ配下にオブジェクトはありません: %s)%s\n' "${C_YELLOW}" "${PREFIX}" "${C_RESET}"
+    else
+      printf '    %s(空のバケットです)%s\n' "${C_YELLOW}" "${C_RESET}"
+    fi
     csv_row "${bucket}" "空バケット" "" "" "" "" "" ""
     return 0
   fi
@@ -363,6 +648,10 @@ list_bucket_contents() {
       printf '    %s[FILE] %s  (%s, %s)\n' \
         "${indent}" "${name}" "$(human_size "${size}")" "${lm}"
       csv_row "${bucket}" "ファイル" "${depth}" "${path}" "${name}" "${size}" "${lm}" "${sc}"
+      # parquet / gz なら内容を画面表示 + ファイル出力（--show-content 指定時のみ）
+      if [[ "${SHOW_CONTENT}" == "true" ]]; then
+        extract_content "${bucket}" "${region}" "${path}" "${size}" "${indent}"
+      fi
     fi
   done < <(LC_ALL=C sort -t$'\t' -k1,1 "${entries_file}")
 
@@ -397,7 +686,13 @@ main() {
 
   log_info "=== 実行内容 ==="
   log_info "  対象バケット      : ${BUCKET_FILTER:-(確認可能な全バケット)}"
+  log_info "  対象ディレクトリ  : ${PREFIX:-(バケット全体)}"
   log_info "  中身の取得        : $([[ "${BUCKETS_ONLY}" == "true" ]] && echo 'しない (--buckets-only)' || echo 'する')"
+  if [[ "${SHOW_CONTENT}" == "true" ]]; then
+    log_info "  内容表示(parquet/gz): する（出力先: ${CONTENT_DIR}）"
+  else
+    log_info "  内容表示(parquet/gz): しない（--show-content で有効化）"
+  fi
   log_info "  表示オブジェクト数: $([[ "${MAX_KEYS}" -gt 0 ]] && echo "最新 ${MAX_KEYS} 件（--max-keys 0 で無制限）" || echo '無制限')"
   log_info "  CSV 出力          : $([[ "${NO_CSV}" == "true" ]] && echo 'しない' || echo "${OUTPUT_CSV}")"
   log_info "  自動スイッチバック: ${AUTO_SWITCH_BACK}"
@@ -458,10 +753,15 @@ main() {
     log_info "  合計サイズ        : $(human_size "${TOTAL_BYTES}")"
     [[ "${DENIED_BUCKETS}" -gt 0 ]] && \
       log_warn "  アクセス不可      : ${DENIED_BUCKETS} バケット（一覧のみ確認可能）"
+    [[ "${SHOW_CONTENT}" == "true" ]] && \
+      log_info "  内容出力ファイル  : $(with_commas "${CONTENT_FILES}") 件（出力先: ${CONTENT_DIR}）"
   fi
 
   if [[ "${NO_CSV}" != "true" ]]; then
     log_success "CSV を出力しました（Excel でそのまま開けます）: ${OUTPUT_CSV}"
+  fi
+  if [[ "${SHOW_CONTENT}" == "true" && "${CONTENT_FILES}" -gt 0 ]]; then
+    log_success "parquet / gz の内容を出力しました: ${CONTENT_DIR}"
   fi
   log_success "完了しました。"
 }
